@@ -10,4 +10,14 @@ urlpatterns = [
         views.cancel_reservation,
         name="cancel_reservation",
     ),
+    path(
+    "pay/<int:reservation_id>/",
+    views.checkout_reservation,
+    name="checkout_reservation",
+    ),
+    path(
+        "stripe/webhook/",
+        views.stripe_webhook,
+        name="stripe_webhook",
+    ),
 ]
