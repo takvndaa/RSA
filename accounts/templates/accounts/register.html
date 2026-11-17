@@ -1,0 +1,22 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Register | DIIVE</title>
+</head>
+<body>
+    <h1>Join DIIVE</h1>
+    <p>Rutherford Swim Association</p>
+
+    <form method="post">
+        {% csrf_token %}
+        {{ form.as_p }}
+
+        <button type="submit">Create Account</button>
+    </form>
+
+    <p>Already registered?
+        <a href="{% url 'login' %}">Log in</a>
+    </p>
+</body>
+</html>

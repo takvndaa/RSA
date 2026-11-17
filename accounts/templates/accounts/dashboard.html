@@ -1,0 +1,27 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Dashboard | DIIVE</title>
+</head>
+<body>
+    <h1>Welcome to DIIVE, {{ user.first_name }}!</h1>
+
+    {% if user.is_superuser %}
+        <p>Administrator account.</p>
+        <a href="{% url 'admin:index' %}">Administration</a>
+    {% elif user.approval_status == "approved" %}
+        <p>Your membership is approved.</p>
+        <p>Lane reservations are coming soon.</p>
+    {% elif user.approval_status == "rejected" %}
+        <p>Your membership application was not approved.</p>
+    {% else %}
+        <p>Your account is awaiting administrator approval.</p>
+    {% endif %}
+
+    <form method="post" action="{% url 'logout' %}">
+        {% csrf_token %}
+        <button type="submit">Log Out</button>
+    </form>
+</body>
+</html>
