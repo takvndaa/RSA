@@ -12,7 +12,8 @@
         <a href="{% url 'admin:index' %}">Administration</a>
     {% elif user.approval_status == "approved" %}
         <p>Your membership is approved.</p>
-        <p>Lane reservations are coming soon.</p>
+        <p><a href="{% url 'availability' %}">Reserve a Lane</a></p>
+        <p><a href="{% url 'my_reservations' %}">My Reservations</a></p>
     {% elif user.approval_status == "rejected" %}
         <p>Your membership application was not approved.</p>
     {% else %}

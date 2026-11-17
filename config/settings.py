@@ -37,8 +37,10 @@ INSTALLED_APPS = [
     "django.contrib.sessions",
     "django.contrib.messages",
     "django.contrib.staticfiles",
+
     "core",
     "accounts",
+    "bookings",
 ]
 
 MIDDLEWARE = [
@@ -133,3 +135,6 @@ AUTH_USER_MODEL = "accounts.User"
 LOGIN_URL = "login"
 LOGIN_REDIRECT_URL = "member_dashboard"
 LOGOUT_REDIRECT_URL = "home"
+
+TIME_ZONE = "America/New_York"
+USE_TZ = True

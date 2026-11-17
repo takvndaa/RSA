@@ -1,0 +1,61 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Book a Lane | DIIVE</title>
+</head>
+<body>
+    <h1>DIIVE — Reserve a Swimming Lane</h1>
+    <p>Rutherford Swim Association</p>
+    <p>Each reservation costs $15 per hour.</p>
+
+    {% for message in messages %}
+        <p>{{ message }}</p>
+    {% endfor %}
+
+    {% if not approved %}
+        <p>Your membership must be approved before you can book.</p>
+    {% endif %}
+
+    <form method="get">
+        <label for="date">Choose a date:</label>
+        <input
+            type="date"
+            id="date"
+            name="date"
+            value="{{ selected_date|date:'Y-m-d' }}"
+        >
+        <button type="submit">View Availability</button>
+    </form>
+
+    {% for slot in slots %}
+        <h2>{{ slot.start|date:"g:i A" }}</h2>
+
+        {% if slot.member_has_booking %}
+            <p>You already have a reservation for this hour.</p>
+        {% elif not slot.can_book %}
+            <p>Booking unavailable for this hour.</p>
+        {% elif slot.available_lanes %}
+            {% for lane in slot.available_lanes %}
+                <form method="post" action="{% url 'create_reservation' %}">
+                    {% csrf_token %}
+                    <input type="hidden" name="date"
+                           value="{{ selected_date|date:'Y-m-d' }}">
+                    <input type="hidden" name="hour"
+                           value="{{ slot.hour }}">
+                    <input type="hidden" name="lane"
+                           value="{{ lane.number }}">
+                    <button type="submit">
+                        Reserve Lane {{ lane.number }} — $15
+                    </button>
+                </form>
+            {% endfor %}
+        {% else %}
+            <p>All lanes are reserved.</p>
+        {% endif %}
+    {% endfor %}
+
+    <p><a href="{% url 'my_reservations' %}">My Reservations</a></p>
+    <p><a href="{% url 'member_dashboard' %}">Dashboard</a></p>
+</body>
+</html>
