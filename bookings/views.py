@@ -406,7 +406,6 @@ def checkout_reservation(request, reservation_id):
         checkout_session = stripe.checkout.Session.create(
             idempotency_key=f"diive-checkout-reservation-{reservation.id}-v1",
             mode="payment",
-            payment_method_types=["card"],
             line_items=[
                 {
                     "price_data": {
@@ -551,8 +550,10 @@ def stripe_webhook(request):
     except (ValueError, TypeError):
         return HttpResponse(status=200)
 
-    event_created = event.get("created")
-
+    event_created = (
+        event.to_dict() if hasattr(event, "to_dict") else dict(event)
+        ).get("created")
+        
     if event_created is not None:
         try:
             payment_event_time = datetime.fromtimestamp(
