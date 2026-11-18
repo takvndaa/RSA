@@ -18,6 +18,37 @@ def flag_payment_review(reservation, reason, details="", session_id=None):
     return review
 
 
+def verify_checkout_session_closed(session_id):
+    """Return (safe_to_release, review_reason, details).
+
+    The result of Session.expire, not the earlier retrieval, is authoritative
+    when the session was open. Uncertain results retain the lane.
+    Stripe API errors propagate to the caller for its existing handling.
+    """
+    session = stripe.checkout.Session.retrieve(session_id)
+    if getattr(session, "payment_status", None) == "paid":
+        return False, "paid_session_unreconciled", "Stripe reports a paid session"
+
+    if session.status == "open":
+        result = stripe.checkout.Session.expire(session_id)
+        if getattr(result, "payment_status", None) == "paid":
+            return False, "paid_session_unreconciled", "Stripe expiration returned a paid session"
+        if (getattr(result, "status", None) == "expired"
+                and getattr(result, "payment_status", None) == "unpaid"):
+            return True, "", ""
+        return False, "checkout_expiration_unverified", "Stripe expiration response did not confirm an expired, unpaid session"
+
+    if session.status == "expired":
+        if getattr(session, "payment_status", None) == "unpaid":
+            return True, "", ""
+        return False, "checkout_expiration_unverified", "Expired session has an unverified payment status"
+
+    if session.status == "complete":
+        return False, "completed_session_unreconciled", "Checkout session completed"
+
+    return False, "unknown_session_status", str(session.status)
+
+
 def expire_unpaid_reservations():
     """Safely release old unpaid lanes; retain uncertain Stripe payments."""
     cutoff = timezone.now() - PAYMENT_WINDOW
@@ -25,15 +56,10 @@ def expire_unpaid_reservations():
     review_count = 0
     pending = Reservation.objects.filter(status=Reservation.Status.PENDING, created_at__lte=cutoff)
     for reservation in pending:
-        # Never release a lane while Stripe session creation is in progress,
-        # including if the worker died and left the claim behind.
         if reservation.checkout_creation_started_at is not None:
             flag_payment_review(reservation, "checkout_creation_unresolved")
             review_count += 1
             continue
-        # A failed network response may hide a successfully created Stripe
-        # session. Never release this lane until the retry recovers that
-        # session or staff explicitly resolves the uncertainty.
         if (
             not reservation.stripe_checkout_session_id
             and PaymentReview.objects.filter(
@@ -52,19 +78,13 @@ def expire_unpaid_reservations():
                 continue
             stripe.api_key = settings.STRIPE_SECRET_KEY
             try:
-                session = stripe.checkout.Session.retrieve(session_id)
-                if session.status == "open":
-                    stripe.checkout.Session.expire(session_id)
-                elif session.status == "complete":
-                    flag_payment_review(reservation, "completed_session_unreconciled")
-                    review_count += 1
-                    continue
-                elif session.status != "expired":
-                    flag_payment_review(reservation, "unknown_session_status", str(session.status))
-                    review_count += 1
-                    continue
+                safe, reason, details = verify_checkout_session_closed(session_id)
             except stripe.StripeError as exc:
                 flag_payment_review(reservation, "stripe_api_error", str(exc))
+                review_count += 1
+                continue
+            if not safe:
+                flag_payment_review(reservation, reason, details, session_id=session_id)
                 review_count += 1
                 continue
         updated = Reservation.objects.filter(

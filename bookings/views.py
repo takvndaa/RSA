@@ -1,4 +1,3 @@
-
 from datetime import datetime, time, timedelta
 from zoneinfo import ZoneInfo
 import logging
@@ -19,7 +18,7 @@ from django.views.decorators.csrf import csrf_exempt
 from django.views.decorators.http import require_POST
 
 from .models import Lane, Reservation, TimeSlot
-from .services import expire_unpaid_reservations, flag_payment_review
+from .services import expire_unpaid_reservations, flag_payment_review, verify_checkout_session_closed
 
 
 logger = logging.getLogger(__name__)
@@ -260,24 +259,12 @@ def cancel_reservation(request, reservation_id):
         stripe.api_key = settings.STRIPE_SECRET_KEY
 
         try:
-            session = stripe.checkout.Session.retrieve(session_id)
-
-            if session.status == "open":
-                stripe.checkout.Session.expire(session_id)
-
-            elif session.status == "complete":
+            safe, reason, details = verify_checkout_session_closed(session_id)
+            if not safe:
+                flag_payment_review(reservation, reason, details, session_id=session_id)
                 messages.error(
                     request,
-                    "Payment has completed. Please wait for "
-                    "confirmation or contact staff."
-                )
-                return redirect("my_reservations")
-
-            elif session.status != "expired":
-                messages.error(
-                    request,
-                    "Payment status is uncertain. "
-                    "Please contact staff."
+                    "Payment status is not safely closed. Please contact staff for review.",
                 )
                 return redirect("my_reservations")
 
