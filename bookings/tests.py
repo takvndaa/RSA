@@ -1135,3 +1135,106 @@ class PaymentExpirationTests(BookingTestSetup):
             reservation=reservation, reason="stripe_not_configured",
             stripe_session_id="cs_review_no_key", resolved=False
         ).exists())
+
+
+class StripeIdempotencyTests(BookingTestSetup):
+    """Focused regression tests for retry-safe Checkout creation."""
+
+    @override_settings(STRIPE_SECRET_KEY="sk_test_mock", SITE_URL="http://testserver")
+    @patch("bookings.views.stripe.checkout.Session.create")
+    def test_checkout_passes_reservation_specific_idempotency_key(self, mock_create):
+        reservation = self.make_reservation(minutes_ago=5)
+        mock_create.return_value = SimpleNamespace(id="cs_idem_one", url="https://checkout.stripe.com/one")
+        self.client.post(reverse("checkout_reservation", args=[reservation.pk]))
+        self.assertEqual(mock_create.call_args.kwargs["idempotency_key"],
+                         f"diive-checkout-reservation-{reservation.pk}-v1")
+
+    @override_settings(STRIPE_SECRET_KEY="sk_test_mock", SITE_URL="http://testserver")
+    @patch("bookings.views.stripe.checkout.Session.create")
+    def test_checkout_idempotency_key_is_stable_after_connection_failure(self, mock_create):
+        reservation = self.make_reservation(minutes_ago=5)
+        mock_create.side_effect = [
+            stripe.APIConnectionError(message="Simulated interrupted response"),
+            SimpleNamespace(id="cs_retry", url="https://checkout.stripe.com/retry"),
+        ]
+        url = reverse("checkout_reservation", args=[reservation.pk])
+        self.client.post(url)
+        self.client.post(url)
+        self.assertEqual(mock_create.call_count, 2)
+        keys = [call.kwargs["idempotency_key"] for call in mock_create.call_args_list]
+        self.assertEqual(keys[0], keys[1])
+
+    @override_settings(STRIPE_SECRET_KEY="sk_test_mock", SITE_URL="http://testserver")
+    @patch("bookings.views.stripe.checkout.Session.create")
+    def test_checkout_idempotency_key_differs_between_reservations(self, mock_create):
+        first = self.make_reservation(minutes_ago=5)
+        second_slot = TimeSlot.objects.create(start_time=self.start_time + timedelta(hours=1))
+        second = Reservation.objects.create(member=self.other_member, lane=self.lane2, timeslot=second_slot)
+        Reservation.objects.filter(pk=second.pk).update(created_at=timezone.now() - timedelta(minutes=5))
+        mock_create.side_effect = [
+            SimpleNamespace(id="cs_first", url="https://checkout.stripe.com/first"),
+            SimpleNamespace(id="cs_second", url="https://checkout.stripe.com/second"),
+        ]
+        self.client.post(reverse("checkout_reservation", args=[first.pk]))
+        self.client.force_login(self.other_member)
+        self.client.post(reverse("checkout_reservation", args=[second.pk]))
+        self.assertNotEqual(mock_create.call_args_list[0].kwargs["idempotency_key"],
+                            mock_create.call_args_list[1].kwargs["idempotency_key"])
+
+    @override_settings(STRIPE_SECRET_KEY="sk_test_mock", SITE_URL="http://testserver")
+    @patch("bookings.views.stripe.checkout.Session.create")
+    def test_checkout_keeps_reservation_metadata(self, mock_create):
+        reservation = self.make_reservation(minutes_ago=5)
+        mock_create.return_value = SimpleNamespace(id="cs_meta", url="https://checkout.stripe.com/meta")
+        self.client.post(reverse("checkout_reservation", args=[reservation.pk]))
+        kwargs = mock_create.call_args.kwargs
+        self.assertEqual(kwargs["metadata"]["reservation_id"], str(reservation.pk))
+        self.assertEqual(kwargs["client_reference_id"], str(reservation.pk))
+
+    @override_settings(STRIPE_SECRET_KEY="sk_test_mock", SITE_URL="http://testserver")
+    @patch("bookings.views.stripe.checkout.Session.create")
+    def test_checkout_preserves_fifteen_dollar_charge(self, mock_create):
+        reservation = self.make_reservation(minutes_ago=5)
+        mock_create.return_value = SimpleNamespace(id="cs_price", url="https://checkout.stripe.com/price")
+        self.client.post(reverse("checkout_reservation", args=[reservation.pk]))
+        price = mock_create.call_args.kwargs["line_items"][0]["price_data"]
+        self.assertEqual(price["unit_amount"], 1500)
+        self.assertEqual(price["currency"], "usd")
+
+    @override_settings(STRIPE_SECRET_KEY="sk_test_mock", SITE_URL="http://testserver")
+    @patch("bookings.views.stripe.checkout.Session.create")
+    def test_checkout_api_failure_creates_payment_review(self, mock_create):
+        reservation = self.make_reservation(minutes_ago=5)
+        mock_create.side_effect = stripe.APIConnectionError(message="Simulated interrupted response")
+        self.client.post(reverse("checkout_reservation", args=[reservation.pk]))
+        self.assertTrue(PaymentReview.objects.filter(
+            reservation=reservation, reason="checkout_creation_api_error", resolved=False
+        ).exists())
+
+    @override_settings(STRIPE_SECRET_KEY="sk_test_mock", SITE_URL="http://testserver")
+    @patch("bookings.views.stripe.checkout.Session.create")
+    def test_repeated_checkout_failures_do_not_duplicate_review(self, mock_create):
+        reservation = self.make_reservation(minutes_ago=5)
+        mock_create.side_effect = stripe.APIConnectionError(message="Simulated outage")
+        url = reverse("checkout_reservation", args=[reservation.pk])
+        self.client.post(url)
+        self.client.post(url)
+        self.assertEqual(PaymentReview.objects.filter(
+            reservation=reservation, reason="checkout_creation_api_error", resolved=False
+        ).count(), 1)
+
+    @override_settings(STRIPE_SECRET_KEY="sk_test_mock", SITE_URL="http://testserver")
+    @patch("bookings.views.stripe.checkout.Session.create")
+    def test_retry_after_failure_attaches_session_and_clears_claim(self, mock_create):
+        reservation = self.make_reservation(minutes_ago=5)
+        mock_create.side_effect = [
+            stripe.APIConnectionError(message="Simulated outage"),
+            SimpleNamespace(id="cs_recovered", url="https://checkout.stripe.com/recovered"),
+        ]
+        url = reverse("checkout_reservation", args=[reservation.pk])
+        self.client.post(url)
+        response = self.client.post(url)
+        reservation.refresh_from_db()
+        self.assertEqual(response.url, "https://checkout.stripe.com/recovered")
+        self.assertEqual(reservation.stripe_checkout_session_id, "cs_recovered")
+        self.assertIsNone(reservation.checkout_creation_started_at)

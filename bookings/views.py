@@ -402,7 +402,10 @@ def checkout_reservation(request, reservation_id):
         return redirect("my_reservations")
 
     try:
+        # Reuse the same Stripe idempotency key for every retry of this
+        # reservation. A connection failure does not prove Stripe failed.
         checkout_session = stripe.checkout.Session.create(
+            idempotency_key=f"diive-checkout-reservation-{reservation.id}-v1",
             mode="payment",
             payment_method_types=["card"],
             line_items=[
@@ -434,7 +437,12 @@ def checkout_reservation(request, reservation_id):
             ),
         )
 
-    except stripe.StripeError:
+    except stripe.StripeError as exc:
+        # Preserve an audit trail for an ambiguous Stripe outcome. A retry
+        # uses the SAME idempotency key instead of creating a fresh session.
+        flag_payment_review(
+            reservation, "checkout_creation_api_error", str(exc), session_id=""
+        )
         Reservation.objects.filter(
             id=reservation.id, status=Reservation.Status.PENDING,
             checkout_creation_started_at=claimed_at,
