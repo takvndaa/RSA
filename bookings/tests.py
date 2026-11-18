@@ -1036,3 +1036,102 @@ class PaymentExpirationTests(BookingTestSetup):
             reservation=reservation, reason="late_payment",
             stripe_session_id="cs_review_repeat", resolved=False
         ).count(), 1)
+
+
+    def test_reservation_just_before_payment_deadline_stays_pending(self):
+        reservation = self.make_reservation(minutes_ago=5)
+        now = timezone.now()
+        Reservation.objects.filter(pk=reservation.pk).update(
+            created_at=now - timedelta(minutes=15) + timedelta(seconds=1)
+        )
+        with patch("bookings.services.timezone.now", return_value=now):
+            counts = expire_unpaid_reservations()
+        reservation.refresh_from_db()
+        self.assertEqual(counts, (0, 0))
+        self.assertEqual(reservation.status, Reservation.Status.PENDING)
+
+    def test_reservation_at_exact_payment_deadline_expires(self):
+        reservation = self.make_reservation(minutes_ago=5)
+        now = timezone.now()
+        Reservation.objects.filter(pk=reservation.pk).update(
+            created_at=now - timedelta(minutes=15)
+        )
+        with patch("bookings.services.timezone.now", return_value=now):
+            counts = expire_unpaid_reservations()
+        reservation.refresh_from_db()
+        self.assertEqual(counts, (1, 0))
+        self.assertEqual(reservation.status, Reservation.Status.EXPIRED)
+
+    def test_repeated_expiration_does_not_count_same_reservation_twice(self):
+        reservation = self.make_reservation(minutes_ago=20)
+        first = expire_unpaid_reservations()
+        second = expire_unpaid_reservations()
+        reservation.refresh_from_db()
+        self.assertEqual(first, (1, 0))
+        self.assertEqual(second, (0, 0))
+        self.assertEqual(reservation.status, Reservation.Status.EXPIRED)
+
+    def test_interrupted_checkout_claim_keeps_one_review_record(self):
+        reservation = self.make_reservation(minutes_ago=20)
+        Reservation.objects.filter(pk=reservation.pk).update(
+            checkout_creation_started_at=timezone.now() - timedelta(minutes=30)
+        )
+        self.assertEqual(expire_unpaid_reservations(), (0, 1))
+        self.assertEqual(expire_unpaid_reservations(), (0, 1))
+        reservation.refresh_from_db()
+        self.assertEqual(reservation.status, Reservation.Status.PENDING)
+        self.assertEqual(PaymentReview.objects.filter(
+            reservation=reservation, reason="checkout_creation_unresolved", resolved=False
+        ).count(), 1)
+
+    @override_settings(STRIPE_SECRET_KEY="sk_test_mock")
+    @patch("bookings.services.stripe.checkout.Session.retrieve")
+    def test_completed_checkout_creates_reconciliation_review(self, mock_retrieve):
+        reservation = self.make_reservation(minutes_ago=20, session_id="cs_review_complete")
+        mock_retrieve.return_value = SimpleNamespace(status="complete")
+        self.assertEqual(expire_unpaid_reservations(), (0, 1))
+        reservation.refresh_from_db()
+        self.assertEqual(reservation.status, Reservation.Status.PENDING)
+        self.assertTrue(PaymentReview.objects.filter(
+            reservation=reservation, reason="completed_session_unreconciled",
+            stripe_session_id="cs_review_complete", resolved=False
+        ).exists())
+
+    @override_settings(STRIPE_SECRET_KEY="sk_test_mock")
+    @patch("bookings.services.stripe.checkout.Session.retrieve")
+    def test_unknown_checkout_status_creates_review(self, mock_retrieve):
+        reservation = self.make_reservation(minutes_ago=20, session_id="cs_review_unknown")
+        mock_retrieve.return_value = SimpleNamespace(status="unexpected")
+        self.assertEqual(expire_unpaid_reservations(), (0, 1))
+        reservation.refresh_from_db()
+        self.assertEqual(reservation.status, Reservation.Status.PENDING)
+        self.assertTrue(PaymentReview.objects.filter(
+            reservation=reservation, reason="unknown_session_status",
+            stripe_session_id="cs_review_unknown", resolved=False
+        ).exists())
+
+    @override_settings(STRIPE_SECRET_KEY="sk_test_mock")
+    @patch("bookings.services.stripe.checkout.Session.retrieve")
+    def test_expiration_stripe_connection_failure_creates_review(self, mock_retrieve):
+        reservation = self.make_reservation(minutes_ago=20, session_id="cs_review_api_error")
+        mock_retrieve.side_effect = stripe.APIConnectionError(message="Simulated outage")
+        self.assertEqual(expire_unpaid_reservations(), (0, 1))
+        reservation.refresh_from_db()
+        self.assertEqual(reservation.status, Reservation.Status.PENDING)
+        self.assertTrue(PaymentReview.objects.filter(
+            reservation=reservation, reason="stripe_api_error",
+            stripe_session_id="cs_review_api_error", resolved=False
+        ).exists())
+
+    @override_settings(STRIPE_SECRET_KEY="")
+    @patch("bookings.services.stripe.checkout.Session.retrieve")
+    def test_missing_stripe_configuration_creates_review_without_api_call(self, mock_retrieve):
+        reservation = self.make_reservation(minutes_ago=20, session_id="cs_review_no_key")
+        self.assertEqual(expire_unpaid_reservations(), (0, 1))
+        mock_retrieve.assert_not_called()
+        reservation.refresh_from_db()
+        self.assertEqual(reservation.status, Reservation.Status.PENDING)
+        self.assertTrue(PaymentReview.objects.filter(
+            reservation=reservation, reason="stripe_not_configured",
+            stripe_session_id="cs_review_no_key", resolved=False
+        ).exists())
