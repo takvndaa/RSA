@@ -1340,3 +1340,230 @@ class UncertainCheckoutReconciliationTests(BookingTestSetup):
             reservation=reservation, reason="checkout_creation_api_error",
             resolved=False,
         ).count(), 1)
+
+
+class PaidSessionReleaseSafetyTests(BookingTestSetup):
+    """Paid Stripe sessions cannot free lanes via cleanup or cancellation."""
+
+    @override_settings(STRIPE_SECRET_KEY="sk_test_mock")
+    @patch("bookings.services.stripe.checkout.Session.expire")
+    @patch("bookings.services.stripe.checkout.Session.retrieve")
+    def test_cleanup_paid_open_session_keeps_lane(self, retrieve, expire):
+        reservation = self.make_reservation(session_id="cs_paid_open")
+        retrieve.return_value = SimpleNamespace(status="open", payment_status="paid")
+        self.assertEqual(expire_unpaid_reservations(), (0, 1))
+        reservation.refresh_from_db()
+        self.assertEqual(reservation.status, Reservation.Status.PENDING)
+        expire.assert_not_called()
+        self.assertTrue(PaymentReview.objects.filter(
+            reservation=reservation, reason="paid_session_unreconciled", resolved=False
+        ).exists())
+
+    @override_settings(STRIPE_SECRET_KEY="sk_test_mock")
+    @patch("bookings.services.stripe.checkout.Session.expire")
+    @patch("bookings.services.stripe.checkout.Session.retrieve")
+    def test_cleanup_paid_expired_session_keeps_lane(self, retrieve, expire):
+        reservation = self.make_reservation(session_id="cs_paid_expired")
+        retrieve.return_value = SimpleNamespace(status="expired", payment_status="paid")
+        self.assertEqual(expire_unpaid_reservations(), (0, 1))
+        reservation.refresh_from_db()
+        self.assertEqual(reservation.status, Reservation.Status.PENDING)
+        expire.assert_not_called()
+
+    @override_settings(STRIPE_SECRET_KEY="sk_test_mock")
+    @patch("bookings.services.stripe.checkout.Session.retrieve")
+    def test_cleanup_paid_complete_session_flags_review(self, retrieve):
+        reservation = self.make_reservation(session_id="cs_paid_complete")
+        retrieve.return_value = SimpleNamespace(status="complete", payment_status="paid")
+        self.assertEqual(expire_unpaid_reservations(), (0, 1))
+        self.assertTrue(PaymentReview.objects.filter(
+            reservation=reservation, reason="paid_session_unreconciled", resolved=False
+        ).exists())
+
+    @override_settings(STRIPE_SECRET_KEY="sk_test_mock")
+    @patch("bookings.services.stripe.checkout.Session.retrieve")
+    def test_cleanup_unpaid_expired_session_still_releases_lane(self, retrieve):
+        reservation = self.make_reservation(session_id="cs_unpaid_expired")
+        retrieve.return_value = SimpleNamespace(status="expired", payment_status="unpaid")
+        self.assertEqual(expire_unpaid_reservations(), (1, 0))
+        reservation.refresh_from_db()
+        self.assertEqual(reservation.status, Reservation.Status.EXPIRED)
+
+    @override_settings(STRIPE_SECRET_KEY="sk_test_mock")
+    @patch("bookings.views.stripe.checkout.Session.expire")
+    @patch("bookings.views.stripe.checkout.Session.retrieve")
+    def test_cancel_paid_open_session_keeps_lane(self, retrieve, expire):
+        reservation = self.make_reservation(minutes_ago=5, session_id="cs_cancel_paid_open")
+        retrieve.return_value = SimpleNamespace(status="open", payment_status="paid")
+        self.client.post(reverse("cancel_reservation", args=[reservation.pk]))
+        reservation.refresh_from_db()
+        self.assertEqual(reservation.status, Reservation.Status.PENDING)
+        expire.assert_not_called()
+        self.assertTrue(PaymentReview.objects.filter(
+            reservation=reservation, reason="paid_session_unreconciled", resolved=False
+        ).exists())
+
+    @override_settings(STRIPE_SECRET_KEY="sk_test_mock")
+    @patch("bookings.views.stripe.checkout.Session.expire")
+    @patch("bookings.views.stripe.checkout.Session.retrieve")
+    def test_cancel_paid_expired_session_keeps_lane(self, retrieve, expire):
+        reservation = self.make_reservation(minutes_ago=5, session_id="cs_cancel_paid_expired")
+        retrieve.return_value = SimpleNamespace(status="expired", payment_status="paid")
+        self.client.post(reverse("cancel_reservation", args=[reservation.pk]))
+        reservation.refresh_from_db()
+        self.assertEqual(reservation.status, Reservation.Status.PENDING)
+        expire.assert_not_called()
+
+    @override_settings(STRIPE_SECRET_KEY="sk_test_mock")
+    @patch("bookings.views.stripe.checkout.Session.expire")
+    @patch("bookings.views.stripe.checkout.Session.retrieve")
+    def test_cancel_paid_complete_session_flags_review(self, retrieve, expire):
+        reservation = self.make_reservation(minutes_ago=5, session_id="cs_cancel_paid_complete")
+        retrieve.return_value = SimpleNamespace(status="complete", payment_status="paid")
+        self.client.post(reverse("cancel_reservation", args=[reservation.pk]))
+        self.assertTrue(PaymentReview.objects.filter(
+            reservation=reservation, reason="paid_session_unreconciled", resolved=False
+        ).exists())
+        expire.assert_not_called()
+
+    @override_settings(STRIPE_SECRET_KEY="sk_test_mock")
+    @patch("bookings.views.stripe.checkout.Session.expire")
+    @patch("bookings.views.stripe.checkout.Session.retrieve")
+    def test_cancel_unpaid_expired_session_still_cancels(self, retrieve, expire):
+        reservation = self.make_reservation(minutes_ago=5, session_id="cs_cancel_unpaid_expired")
+        retrieve.return_value = SimpleNamespace(status="expired", payment_status="unpaid")
+        self.client.post(reverse("cancel_reservation", args=[reservation.pk]))
+        reservation.refresh_from_db()
+        self.assertEqual(reservation.status, Reservation.Status.CANCELLED)
+        expire.assert_not_called()
+
+
+class PaymentExpirationRaceTests(BookingTestSetup):
+    """Conditional SQLite updates must not overwrite intervening changes."""
+
+    @override_settings(STRIPE_SECRET_KEY="sk_test_mock")
+    @patch("bookings.services.stripe.checkout.Session.expire")
+    @patch("bookings.services.stripe.checkout.Session.retrieve")
+    def test_cleanup_does_not_overwrite_confirmation_during_retrieve(self, retrieve, expire):
+        reservation = self.make_reservation(session_id="cs_race_cleanup_retrieve")
+
+        def confirm_during_retrieve(_session_id):
+            Reservation.objects.filter(pk=reservation.pk).update(status=Reservation.Status.CONFIRMED)
+            return SimpleNamespace(status="open", payment_status="unpaid")
+
+        retrieve.side_effect = confirm_during_retrieve
+        self.assertEqual(expire_unpaid_reservations(), (0, 0))
+        reservation.refresh_from_db()
+        self.assertEqual(reservation.status, Reservation.Status.CONFIRMED)
+
+    @override_settings(STRIPE_SECRET_KEY="sk_test_mock")
+    @patch("bookings.services.stripe.checkout.Session.expire")
+    @patch("bookings.services.stripe.checkout.Session.retrieve")
+    def test_cleanup_does_not_overwrite_confirmation_during_expire(self, retrieve, expire):
+        reservation = self.make_reservation(session_id="cs_race_cleanup_expire")
+        retrieve.return_value = SimpleNamespace(status="open", payment_status="unpaid")
+
+        def confirm_during_expire(_session_id):
+            Reservation.objects.filter(pk=reservation.pk).update(status=Reservation.Status.CONFIRMED)
+
+        expire.side_effect = confirm_during_expire
+        self.assertEqual(expire_unpaid_reservations(), (0, 0))
+        reservation.refresh_from_db()
+        self.assertEqual(reservation.status, Reservation.Status.CONFIRMED)
+        expire.assert_called_once_with("cs_race_cleanup_expire")
+
+    @override_settings(STRIPE_SECRET_KEY="sk_test_mock")
+    @patch("bookings.services.stripe.checkout.Session.expire")
+    @patch("bookings.services.stripe.checkout.Session.retrieve")
+    def test_cleanup_does_not_overwrite_cancellation_during_expire(self, retrieve, expire):
+        reservation = self.make_reservation(session_id="cs_race_cleanup_cancel")
+        retrieve.return_value = SimpleNamespace(status="open", payment_status="unpaid")
+
+        def cancel_during_expire(_session_id):
+            Reservation.objects.filter(pk=reservation.pk).update(status=Reservation.Status.CANCELLED)
+
+        expire.side_effect = cancel_during_expire
+        self.assertEqual(expire_unpaid_reservations(), (0, 0))
+        reservation.refresh_from_db()
+        self.assertEqual(reservation.status, Reservation.Status.CANCELLED)
+
+    @override_settings(STRIPE_SECRET_KEY="sk_test_mock")
+    @patch("bookings.services.stripe.checkout.Session.expire")
+    @patch("bookings.services.stripe.checkout.Session.retrieve")
+    def test_cleanup_does_not_overwrite_new_creation_claim(self, retrieve, expire):
+        reservation = self.make_reservation(session_id="cs_race_cleanup_claim")
+        retrieve.return_value = SimpleNamespace(status="open", payment_status="unpaid")
+        claimed_at = timezone.now()
+
+        def claim_during_expire(_session_id):
+            Reservation.objects.filter(pk=reservation.pk).update(checkout_creation_started_at=claimed_at)
+
+        expire.side_effect = claim_during_expire
+        self.assertEqual(expire_unpaid_reservations(), (0, 0))
+        reservation.refresh_from_db()
+        self.assertEqual(reservation.status, Reservation.Status.PENDING)
+        self.assertEqual(reservation.checkout_creation_started_at, claimed_at)
+
+    @override_settings(STRIPE_SECRET_KEY="sk_test_mock")
+    @patch("bookings.views.stripe.checkout.Session.expire")
+    @patch("bookings.views.stripe.checkout.Session.retrieve")
+    def test_cancellation_does_not_overwrite_confirmation_during_retrieve(self, retrieve, expire):
+        reservation = self.make_reservation(minutes_ago=5, session_id="cs_race_cancel_retrieve")
+
+        def confirm_during_retrieve(_session_id):
+            Reservation.objects.filter(pk=reservation.pk).update(status=Reservation.Status.CONFIRMED)
+            return SimpleNamespace(status="open", payment_status="unpaid")
+
+        retrieve.side_effect = confirm_during_retrieve
+        self.client.post(reverse("cancel_reservation", args=[reservation.pk]))
+        reservation.refresh_from_db()
+        self.assertEqual(reservation.status, Reservation.Status.CONFIRMED)
+
+    @override_settings(STRIPE_SECRET_KEY="sk_test_mock")
+    @patch("bookings.views.stripe.checkout.Session.expire")
+    @patch("bookings.views.stripe.checkout.Session.retrieve")
+    def test_cancellation_does_not_overwrite_confirmation_during_expire(self, retrieve, expire):
+        reservation = self.make_reservation(minutes_ago=5, session_id="cs_race_cancel_expire")
+        retrieve.return_value = SimpleNamespace(status="open", payment_status="unpaid")
+
+        def confirm_during_expire(_session_id):
+            Reservation.objects.filter(pk=reservation.pk).update(status=Reservation.Status.CONFIRMED)
+
+        expire.side_effect = confirm_during_expire
+        self.client.post(reverse("cancel_reservation", args=[reservation.pk]))
+        reservation.refresh_from_db()
+        self.assertEqual(reservation.status, Reservation.Status.CONFIRMED)
+        expire.assert_called_once_with("cs_race_cancel_expire")
+
+    @override_settings(STRIPE_SECRET_KEY="sk_test_mock")
+    @patch("bookings.views.stripe.checkout.Session.expire")
+    @patch("bookings.views.stripe.checkout.Session.retrieve")
+    def test_cancellation_does_not_overwrite_new_creation_claim(self, retrieve, expire):
+        reservation = self.make_reservation(minutes_ago=5, session_id="cs_race_cancel_claim")
+        retrieve.return_value = SimpleNamespace(status="open", payment_status="unpaid")
+        claimed_at = timezone.now()
+
+        def claim_during_expire(_session_id):
+            Reservation.objects.filter(pk=reservation.pk).update(checkout_creation_started_at=claimed_at)
+
+        expire.side_effect = claim_during_expire
+        self.client.post(reverse("cancel_reservation", args=[reservation.pk]))
+        reservation.refresh_from_db()
+        self.assertEqual(reservation.status, Reservation.Status.PENDING)
+        self.assertEqual(reservation.checkout_creation_started_at, claimed_at)
+
+    @override_settings(STRIPE_SECRET_KEY="sk_test_mock")
+    @patch("bookings.views.stripe.checkout.Session.expire")
+    @patch("bookings.views.stripe.checkout.Session.retrieve")
+    def test_cancellation_does_not_overwrite_changed_session_id(self, retrieve, expire):
+        reservation = self.make_reservation(minutes_ago=5, session_id="cs_race_cancel_old")
+        retrieve.return_value = SimpleNamespace(status="open", payment_status="unpaid")
+
+        def change_session_during_expire(_session_id):
+            Reservation.objects.filter(pk=reservation.pk).update(stripe_checkout_session_id="cs_race_cancel_new")
+
+        expire.side_effect = change_session_during_expire
+        self.client.post(reverse("cancel_reservation", args=[reservation.pk]))
+        reservation.refresh_from_db()
+        self.assertEqual(reservation.status, Reservation.Status.PENDING)
+        self.assertEqual(reservation.stripe_checkout_session_id, "cs_race_cancel_new")
