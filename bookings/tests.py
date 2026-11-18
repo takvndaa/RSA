@@ -1276,13 +1276,17 @@ class UncertainCheckoutReconciliationTests(BookingTestSetup):
         reservation.refresh_from_db()
         self.assertEqual(reservation.status, Reservation.Status.EXPIRED)
 
-    def test_unrelated_review_does_not_prevent_expiration(self):
+    def test_unresolved_review_prevents_expiration(self):
         reservation = self.make_reservation(minutes_ago=20)
         PaymentReview.objects.create(
-            reservation=reservation, reason="other_reason",
-            stripe_session_id="", resolved=False,
+            reservation=reservation,
+            reason="other_reason",
+            stripe_session_id="",
+            resolved=False,
         )
-        self.assertEqual(expire_unpaid_reservations(), (1, 0))
+        self.assertEqual(expire_unpaid_reservations(), (0, 1))
+        reservation.refresh_from_db()
+        self.assertEqual(reservation.status, Reservation.Status.PENDING)
 
     def test_unresolved_creation_error_prevents_cancellation(self):
         reservation = self.make_reservation(minutes_ago=5)

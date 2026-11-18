@@ -234,12 +234,7 @@ def cancel_reservation(request, reservation_id):
         messages.error(request, "Payment setup is in progress. Please try again later or contact staff.")
         return redirect("my_reservations")
 
-    if (
-        not reservation.stripe_checkout_session_id
-        and reservation.payment_reviews.filter(
-            reason="checkout_creation_api_error", resolved=False
-        ).exists()
-    ):
+    if reservation.payment_reviews.filter(resolved=False).exists():
         messages.error(
             request,
             "Payment setup is unresolved. Retry payment or contact staff before cancelling.",
@@ -280,17 +275,23 @@ def cancel_reservation(request, reservation_id):
             )
             return redirect("my_reservations")
 
-    updated = Reservation.objects.filter(
-        id=reservation.id,
-        status=Reservation.Status.PENDING,
-        checkout_creation_started_at__isnull=True,
-        stripe_checkout_session_id=session_id,
-    ).update(
-        status=Reservation.Status.CANCELLED
-    )
-
+    with transaction.atomic():
+        updated = (
+            Reservation.objects.filter(
+                id=reservation.id,
+                status=Reservation.Status.PENDING,
+                checkout_creation_started_at__isnull=True,
+                stripe_checkout_session_id=session_id,
+            )
+            .exclude(
+                payment_reviews__resolved=False
+            )
+            .update(
+                status=Reservation.Status.CANCELLED
+            )
+        )
     if updated:
-        messages.success(request, "Reservation cancelled.")
+            messages.success(request, "Reservation cancelled.")
     else:
         messages.error(
             request,

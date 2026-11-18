@@ -1,46 +1,108 @@
+
 <!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>My Reservations | DIIVE</title>
 </head>
 <body>
     <h1>My DIIVE Reservations</h1>
 
     {% for message in messages %}
-        <p>{{ message }}</p>
+        <p role="status">{{ message }}</p>
     {% endfor %}
 
     {% for reservation in reservations %}
         <section>
             <h2>Lane {{ reservation.lane.number }}</h2>
+
             <p>
                 {{ reservation.timeslot.start_time|date:"M d, Y g:i A" }}
             </p>
+
             <p>Status: {{ reservation.get_status_display }}</p>
+
             {% if reservation.status == "pending" %}
+
                 <form method="post"
-                    action="{% url 'checkout_reservation' reservation.id %}">
+                      action="{% url 'checkout_reservation' reservation.id %}">
                     {% csrf_token %}
-                    <button type="submit">Pay $15 with Stripe</button>
+                    <button type="submit">
+                        Pay $15 with Stripe
+                    </button>
                 </form>
-            {% endif %}
 
-
-            {% if reservation.status != "cancelled" %}
                 <form method="post"
                       action="{% url 'cancel_reservation' reservation.id %}">
                     {% csrf_token %}
-                    <button type="submit">Cancel Reservation</button>
+                    <button type="submit">
+                        Cancel Unpaid Reservation
+                    </button>
                 </form>
+
+            {% elif reservation.status == "confirmed" %}
+
+                <p>
+                    Full $15 refund and cancellation requests are
+                    available until 24 hours before the booking starts.
+                </p>
+
+                <p>
+                    Within 24 hours, cancellation and refund are not
+                    available automatically. Contact administration
+                    to discuss an exception.
+                </p>
+
+                {% for cancellation in reservation.cancellation_requests.all %}
+                    <p>
+                        Cancellation request #{{ cancellation.id }}:
+                        {{ cancellation.get_decision_display }}
+
+                        {% if cancellation.eligible_for_full_refund %}
+                            (full refund eligible)
+                        {% endif %}
+                    </p>
+                {% endfor %}
+
+                <form method="post"
+                      action="{% url 'request_cancellation' reservation.id %}">
+                    {% csrf_token %}
+
+                    <label for="reason-{{ reservation.id }}">
+                        Reason (optional)
+                    </label>
+
+                    <textarea
+                        id="reason-{{ reservation.id }}"
+                        name="reason"
+                        maxlength="2000"
+                        rows="2"></textarea>
+
+                    <button type="submit">
+                        Request Cancellation &amp; Refund
+                    </button>
+                </form>
+
             {% endif %}
         </section>
+
         <hr>
+
     {% empty %}
         <p>You have no reservations yet.</p>
     {% endfor %}
 
-    <p><a href="{% url 'availability' %}">Book Another Lane</a></p>
-    <p><a href="{% url 'member_dashboard' %}">Dashboard</a></p>
+    <p>
+        <a href="{% url 'availability' %}">
+            Book Another Lane
+        </a>
+    </p>
+
+    <p>
+        <a href="{% url 'member_dashboard' %}">
+            Dashboard
+        </a>
+    </p>
 </body>
 </html>
