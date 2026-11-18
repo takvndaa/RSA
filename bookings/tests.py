@@ -1238,3 +1238,105 @@ class StripeIdempotencyTests(BookingTestSetup):
         self.assertEqual(response.url, "https://checkout.stripe.com/recovered")
         self.assertEqual(reservation.stripe_checkout_session_id, "cs_recovered")
         self.assertIsNone(reservation.checkout_creation_started_at)
+
+class UncertainCheckoutReconciliationTests(BookingTestSetup):
+    """Do not free lanes after an ambiguous Checkout creation response."""
+
+    def mark_uncertain(self, reservation):
+        return PaymentReview.objects.create(
+            reservation=reservation,
+            reason="checkout_creation_api_error",
+            stripe_session_id="",
+            details="Simulated interrupted response",
+        )
+
+    def test_unresolved_creation_error_prevents_expiration(self):
+        reservation = self.make_reservation(minutes_ago=20)
+        self.mark_uncertain(reservation)
+        self.assertEqual(expire_unpaid_reservations(), (0, 1))
+        reservation.refresh_from_db()
+        self.assertEqual(reservation.status, Reservation.Status.PENDING)
+
+    def test_repeated_cleanup_keeps_uncertain_lane_reserved(self):
+        reservation = self.make_reservation(minutes_ago=20)
+        self.mark_uncertain(reservation)
+        self.assertEqual(expire_unpaid_reservations(), (0, 1))
+        self.assertEqual(expire_unpaid_reservations(), (0, 1))
+        self.assertEqual(PaymentReview.objects.filter(
+            reservation=reservation, reason="checkout_creation_api_error"
+        ).count(), 1)
+
+    def test_resolved_creation_error_allows_expiration(self):
+        reservation = self.make_reservation(minutes_ago=20)
+        review = self.mark_uncertain(reservation)
+        review.resolved = True
+        review.save(update_fields=["resolved"])
+        self.assertEqual(expire_unpaid_reservations(), (1, 0))
+        reservation.refresh_from_db()
+        self.assertEqual(reservation.status, Reservation.Status.EXPIRED)
+
+    def test_unrelated_review_does_not_prevent_expiration(self):
+        reservation = self.make_reservation(minutes_ago=20)
+        PaymentReview.objects.create(
+            reservation=reservation, reason="other_reason",
+            stripe_session_id="", resolved=False,
+        )
+        self.assertEqual(expire_unpaid_reservations(), (1, 0))
+
+    def test_unresolved_creation_error_prevents_cancellation(self):
+        reservation = self.make_reservation(minutes_ago=5)
+        self.mark_uncertain(reservation)
+        response = self.client.post(
+            reverse("cancel_reservation", args=[reservation.pk])
+        )
+        self.assertRedirects(response, reverse("my_reservations"))
+        reservation.refresh_from_db()
+        self.assertEqual(reservation.status, Reservation.Status.PENDING)
+
+    def test_resolved_creation_error_allows_cancellation(self):
+        reservation = self.make_reservation(minutes_ago=5)
+        review = self.mark_uncertain(reservation)
+        review.resolved = True
+        review.save(update_fields=["resolved"])
+        response = self.client.post(
+            reverse("cancel_reservation", args=[reservation.pk])
+        )
+        self.assertRedirects(response, reverse("my_reservations"))
+        reservation.refresh_from_db()
+        self.assertEqual(reservation.status, Reservation.Status.CANCELLED)
+
+    @override_settings(STRIPE_SECRET_KEY="sk_test_mock", SITE_URL="http://testserver")
+    @patch("bookings.views.stripe.checkout.Session.create")
+    def test_successful_retry_resolves_uncertain_review(self, mock_create):
+        reservation = self.make_reservation(minutes_ago=5)
+        review = self.mark_uncertain(reservation)
+        mock_create.return_value = SimpleNamespace(
+            id="cs_recovered_review",
+            url="https://checkout.stripe.com/recovered-review",
+        )
+        response = self.client.post(
+            reverse("checkout_reservation", args=[reservation.pk])
+        )
+        self.assertEqual(response.url, "https://checkout.stripe.com/recovered-review")
+        review.refresh_from_db()
+        reservation.refresh_from_db()
+        self.assertTrue(review.resolved)
+        self.assertEqual(reservation.stripe_checkout_session_id, "cs_recovered_review")
+
+    @override_settings(STRIPE_SECRET_KEY="sk_test_mock", SITE_URL="http://testserver")
+    @patch("bookings.views.stripe.checkout.Session.create")
+    def test_failed_retry_keeps_uncertain_review_open(self, mock_create):
+        reservation = self.make_reservation(minutes_ago=5)
+        review = self.mark_uncertain(reservation)
+        mock_create.side_effect = stripe.APIConnectionError(
+            message="Simulated repeat failure"
+        )
+        self.client.post(
+            reverse("checkout_reservation", args=[reservation.pk])
+        )
+        review.refresh_from_db()
+        self.assertFalse(review.resolved)
+        self.assertEqual(PaymentReview.objects.filter(
+            reservation=reservation, reason="checkout_creation_api_error",
+            resolved=False,
+        ).count(), 1)

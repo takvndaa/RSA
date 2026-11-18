@@ -31,6 +31,19 @@ def expire_unpaid_reservations():
             flag_payment_review(reservation, "checkout_creation_unresolved")
             review_count += 1
             continue
+        # A failed network response may hide a successfully created Stripe
+        # session. Never release this lane until the retry recovers that
+        # session or staff explicitly resolves the uncertainty.
+        if (
+            not reservation.stripe_checkout_session_id
+            and PaymentReview.objects.filter(
+                reservation=reservation,
+                reason="checkout_creation_api_error",
+                resolved=False,
+            ).exists()
+        ):
+            review_count += 1
+            continue
         session_id = reservation.stripe_checkout_session_id
         if session_id:
             if not settings.STRIPE_SECRET_KEY:

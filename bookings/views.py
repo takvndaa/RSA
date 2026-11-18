@@ -235,6 +235,18 @@ def cancel_reservation(request, reservation_id):
         messages.error(request, "Payment setup is in progress. Please try again later or contact staff.")
         return redirect("my_reservations")
 
+    if (
+        not reservation.stripe_checkout_session_id
+        and reservation.payment_reviews.filter(
+            reason="checkout_creation_api_error", resolved=False
+        ).exists()
+    ):
+        messages.error(
+            request,
+            "Payment setup is unresolved. Retry payment or contact staff before cancelling.",
+        )
+        return redirect("my_reservations")
+
     session_id = reservation.stripe_checkout_session_id
 
     if session_id:
@@ -478,6 +490,14 @@ def checkout_reservation(request, reservation_id):
             logger.exception("Could not close unassigned Checkout session %s", checkout_session.id)
         messages.error(request, "This reservation is no longer available for payment.")
         return redirect("my_reservations")
+
+    # A successful idempotent retry recovered the previously uncertain
+    # Checkout session, so the old creation-error review is no longer open.
+    reservation.payment_reviews.filter(
+        reason="checkout_creation_api_error",
+        stripe_session_id="",
+        resolved=False,
+    ).update(resolved=True)
 
     if timezone.now() >= reservation.payment_deadline:
         expire_unpaid_reservations()
